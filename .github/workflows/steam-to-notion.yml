@@ -2,8 +2,8 @@ name: Steam to Notion Sync
 
 on:
   schedule:
-    # GitHub cron uses UTC. 18:00 UTC is 02:00 next day in UTC+8 Beijing time.
-    - cron: "0 18 * * *"
+    # GitHub cron uses UTC. 20:00 UTC is 04:00 next day in UTC+8 Beijing time.
+    - cron: "0 20 * * *"
   workflow_dispatch:
 
 permissions:
@@ -26,14 +26,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Restore sync state
-        uses: actions/cache@v4
-        with:
-          path: .steam_sync_state
-          key: steam-sync-state-${{ github.run_id }}
-          restore-keys: |
-            steam-sync-state-
-
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -47,7 +39,7 @@ jobs:
           NOTION_PLAYTIME_DATA_SOURCE_ID: ${{ secrets.NOTION_PLAYTIME_DATA_SOURCE_ID }}
           NOTION_PERIOD_DATA_SOURCE_ID: ${{ secrets.NOTION_PERIOD_DATA_SOURCE_ID }}
           NOTION_SUMMARY_DATA_SOURCE_ID: ${{ secrets.NOTION_SUMMARY_DATA_SOURCE_ID }}
+          NOTION_SYNC_LOG_DATA_SOURCE_ID: ${{ secrets.NOTION_SYNC_LOG_DATA_SOURCE_ID }}
           NOTION_VERSION: "2025-09-03"
           STEAM_ACHIEVEMENT_MAX_WORKERS: "5"
           STEAM_ACHIEVEMENT_REQUEST_INTERVAL_SECONDS: "0.2"
-          STEAM_SYNC_STATE_FILE: .steam_sync_state/state.json

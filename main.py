@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
@@ -10,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from typing import Any
 from typing import Optional
 
@@ -21,7 +22,7 @@ NOTION_VERSION_DEFAULT = "2025-09-03"
 REQUEST_TIMEOUT_SECONDS = 30
 MAX_RETRY_COUNT = 3
 RETRY_STATUS_CODE_SET = {429, 500, 502, 503, 504}
-STATE_FILE_ENV_NAME = "STEAM_SYNC_STATE_FILE"
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 ACHIEVEMENT_REQUEST_INTERVAL_ENV_NAME = "STEAM_ACHIEVEMENT_REQUEST_INTERVAL_SECONDS"
 ACHIEVEMENT_MAX_WORKER_ENV_NAME = "STEAM_ACHIEVEMENT_MAX_WORKERS"
 DEFAULT_ACHIEVEMENT_REQUEST_INTERVAL_SECONDS = 0.2
@@ -46,8 +47,25 @@ COMPLETE_GAME_NUM_PROPERTY_NAME = "CompleteGameNum"
 FULL_ACHIEVEMENT_GAME_NUM_PROPERTY_NAME = "FullAchievementGameNum"
 PLAYED_GAME_NUM_PROPERTY_NAME = "PlayedGameNum"
 TOTAL_PLAYTIME_MINUTES_PROPERTY_NAME = "TotalPlayTimeMinutes"
+SYNC_LOG_INDEX_PROPERTY_NAME = "Index"
+SYNC_LOG_DATETIME_PROPERTY_NAME = "DateTime"
+SYNC_LOG_MODE_PROPERTY_NAME = "Mode"
+SYNC_LOG_STATUS_PROPERTY_NAME = "Status"
+SYNC_LOG_STEAM_GAME_NUM_PROPERTY_NAME = "SteamGameNum"
+SYNC_LOG_NOTION_GAME_NUM_PROPERTY_NAME = "NotionGameNum"
+SYNC_LOG_CREATED_GAME_NUM_PROPERTY_NAME = "CreatedGameNum"
+SYNC_LOG_UPDATED_GAME_NUM_PROPERTY_NAME = "UpdatedGameNum"
+SYNC_LOG_UNCHANGED_GAME_NUM_PROPERTY_NAME = "UnchangedGameNum"
+SYNC_LOG_CREATED_PLAYTIME_RECORD_NUM_PROPERTY_NAME = "CreatedPlaytimeRecordNum"
+SYNC_LOG_SKIPPED_EXTRA_NOTION_GAME_NUM_PROPERTY_NAME = "SkippedExtraNotionGameNum"
+SYNC_LOG_ERROR_NUM_PROPERTY_NAME = "ErrorNum"
 PERIOD_TYPE_YEAR = "Year"
 PERIOD_TYPE_MONTH = "Month"
+SYNC_MODE_INITIAL = "Initial"
+SYNC_MODE_DAILY = "Daily"
+SYNC_MODE_SAME_DAY_REPEAT = "SameDayRepeat"
+SYNC_STATUS_SUCCESS = "Success"
+SYNC_STATUS_COMPLETED_WITH_ERRORS = "CompletedWithErrors"
 
 
 @dataclass
@@ -61,6 +79,7 @@ class Config:
     notion_playtime_data_source_id: str
     notion_period_data_source_id: str
     notion_summary_data_source_id: str
+    notion_sync_log_data_source_id: str
     notion_version: str
 
 
@@ -188,11 +207,13 @@ class SyncStats:
 
 
 @dataclass
-class SyncState:
-    """State persisted between GitHub Actions runs."""
+class SyncLogState:
+    """Latest sync log state loaded from Notion."""
 
-    last_update_date: Optional[str] = None
-    has_known_last_update_date: bool = False
+    latest_index: Optional[int] = None
+    last_update_datetime: Optional[datetime] = None
+    has_known_last_update_datetime: bool = False
+    query_succeeded: bool = False
 
 
 class RequestRateLimiter:
@@ -248,6 +269,7 @@ def load_config() -> Optional[Config]:
         "NOTION_API_KEY",
         "NOTION_GAME_DATA_SOURCE_ID",
         "NOTION_PLAYTIME_DATA_SOURCE_ID",
+        "NOTION_SYNC_LOG_DATA_SOURCE_ID",
     ]
     missing_name_list = [name for name in required_name_list if not os.environ.get(name)]
 
@@ -267,79 +289,27 @@ def load_config() -> Optional[Config]:
         notion_playtime_data_source_id=os.environ["NOTION_PLAYTIME_DATA_SOURCE_ID"],
         notion_period_data_source_id=os.environ.get("NOTION_PERIOD_DATA_SOURCE_ID", ""),
         notion_summary_data_source_id=os.environ.get("NOTION_SUMMARY_DATA_SOURCE_ID", ""),
+        notion_sync_log_data_source_id=os.environ["NOTION_SYNC_LOG_DATA_SOURCE_ID"],
         notion_version=os.environ.get("NOTION_VERSION", NOTION_VERSION_DEFAULT),
     )
 
 
-def get_state_file_path() -> Path:
-    """Return the state file path used to persist last update date."""
+def get_beijing_now() -> datetime:
+    """Return the current UTC+8 Beijing datetime."""
 
-    configured_path = os.environ.get(STATE_FILE_ENV_NAME)
-    if configured_path:
-        return Path(configured_path)
-
-    return Path(__file__).resolve().parent / ".steam_sync_state" / "state.json"
+    return datetime.now(BEIJING_TIMEZONE)
 
 
-def load_sync_state(state_file_path: Path) -> SyncState:
-    """Load sync state from a JSON file."""
+def get_beijing_date_text(current_datetime: datetime) -> str:
+    """Return the UTC+8 Beijing date text for a datetime."""
 
-    if not state_file_path.exists():
-        log_info(f"No existing sync state file found. Treating this run as first initialization. path={state_file_path}")
-        return SyncState()
-
-    try:
-        with state_file_path.open("r", encoding="utf-8") as state_file:
-            state_data = json.load(state_file)
-    except (OSError, json.JSONDecodeError) as error:
-        log_warning(
-            "Failed to read sync state file. "
-            f"path={state_file_path}, reason={error}. Treating this run as first initialization."
-        )
-        return SyncState()
-
-    if not isinstance(state_data, dict):
-        log_warning(
-            "Sync state file does not contain a JSON object. "
-            f"path={state_file_path}. Treating this run as first initialization."
-        )
-        return SyncState()
-
-    last_update_date = state_data.get("last_update_date")
-    if isinstance(last_update_date, str):
-        last_update_date_text = last_update_date.strip()
-        if last_update_date_text:
-            try:
-                date.fromisoformat(last_update_date_text)
-            except ValueError:
-                log_warning(
-                    "Sync state file contains an invalid last_update_date. "
-                    f"path={state_file_path}, last_update_date={last_update_date_text}. "
-                    "Treating this run as first initialization."
-                )
-                return SyncState()
-
-            return SyncState(last_update_date=last_update_date_text, has_known_last_update_date=True)
-
-    log_warning(
-        "Sync state file does not contain a valid last_update_date. "
-        f"path={state_file_path}. Treating this run as first initialization."
-    )
-
-    return SyncState()
+    return current_datetime.astimezone(BEIJING_TIMEZONE).date().isoformat()
 
 
-def save_sync_state(state_file_path: Path, sync_state: SyncState) -> None:
-    """Save sync state to a JSON file without exposing secrets."""
+def format_beijing_datetime_for_notion(current_datetime: datetime) -> str:
+    """Format a datetime for a Notion date property with explicit UTC+8 offset."""
 
-    try:
-        state_file_path.parent.mkdir(parents=True, exist_ok=True)
-        state_data = {"last_update_date": sync_state.last_update_date}
-        with state_file_path.open("w", encoding="utf-8") as state_file:
-            json.dump(state_data, state_file, ensure_ascii=False, indent=2)
-            state_file.write("\n")
-    except OSError as error:
-        log_warning(f"Failed to save sync state file. path={state_file_path}, reason={error}")
+    return current_datetime.astimezone(BEIJING_TIMEZONE).replace(microsecond=0).isoformat()
 
 
 def send_http_request(
@@ -1011,6 +981,79 @@ def query_notion_pages_from_url_with_body(
             return None
 
 
+def load_sync_log_state(config: Config) -> SyncLogState:
+    """Load the latest sync state from the Notion sync log data source."""
+
+    page_list = query_all_notion_pages(config, config.notion_sync_log_data_source_id)
+    if page_list is None:
+        log_error(
+            "Failed to query Notion sync log data source. "
+            "Treating this run as first initialization."
+        )
+        return SyncLogState()
+
+    if not page_list:
+        log_info("No existing sync log row found. Treating this run as first initialization.")
+        return SyncLogState(query_succeeded=True)
+
+    latest_page: Optional[dict[str, Any]] = None
+    latest_index: Optional[int] = None
+
+    for page in page_list:
+        property_map = page.get("properties", {})
+        if not isinstance(property_map, dict):
+            log_warning(f"Skipped sync log page without valid properties. page_id={page.get('id', 'unknown')}")
+            continue
+
+        index_text = get_notion_title(property_map, SYNC_LOG_INDEX_PROPERTY_NAME)
+        if index_text is None:
+            log_warning(f"Skipped sync log page without Index title. page_id={page.get('id', 'unknown')}")
+            continue
+
+        try:
+            index_value = int(index_text.strip())
+        except ValueError:
+            log_warning(
+                "Skipped sync log page with non-numeric Index. "
+                f"page_id={page.get('id', 'unknown')}, index={index_text}"
+            )
+            continue
+
+        if latest_index is None or index_value > latest_index:
+            latest_index = index_value
+            latest_page = page
+
+    if latest_page is None or latest_index is None:
+        log_warning(
+            "No sync log row with a valid numeric Index was found. "
+            "Treating this run as first initialization."
+        )
+        return SyncLogState(query_succeeded=True)
+
+    property_map = latest_page.get("properties", {})
+    if not isinstance(property_map, dict):
+        log_warning(
+            "Latest sync log row has invalid properties. "
+            f"index={latest_index}. Treating this run as first initialization."
+        )
+        return SyncLogState(latest_index=latest_index, query_succeeded=True)
+
+    last_update_datetime = get_notion_datetime(property_map, SYNC_LOG_DATETIME_PROPERTY_NAME)
+    if last_update_datetime is None:
+        log_warning(
+            "Latest sync log row does not contain a valid DateTime. "
+            f"index={latest_index}. Treating this run as first initialization."
+        )
+        return SyncLogState(latest_index=latest_index, query_succeeded=True)
+
+    return SyncLogState(
+        latest_index=latest_index,
+        last_update_datetime=last_update_datetime,
+        has_known_last_update_datetime=True,
+        query_succeeded=True,
+    )
+
+
 def build_notion_game_page_index(page_list: list[dict[str, Any]], stats: SyncStats) -> dict[int, NotionGamePage]:
     """Build an AppID keyed index from Notion game pages."""
 
@@ -1160,6 +1203,44 @@ def get_notion_rich_text(property_map: dict[str, Any], property_name: str) -> Op
 
     rich_text = "".join(text_part_list).strip()
     return rich_text if rich_text else None
+
+
+def get_notion_datetime(property_map: dict[str, Any], property_name: str) -> Optional[datetime]:
+    """Read a Notion date property and normalize it to UTC+8 Beijing time."""
+
+    date_value = property_map.get(property_name, {}).get("date")
+    if not isinstance(date_value, dict):
+        return None
+
+    start_text = date_value.get("start")
+    if not isinstance(start_text, str) or not start_text.strip():
+        return None
+
+    return parse_notion_datetime_text(start_text.strip())
+
+
+def parse_notion_datetime_text(datetime_text: str) -> Optional[datetime]:
+    """Parse a Notion date or datetime string into UTC+8 Beijing time."""
+
+    normalized_text = datetime_text.replace("Z", "+00:00")
+    try:
+        parsed_datetime = datetime.fromisoformat(normalized_text)
+    except ValueError:
+        try:
+            parsed_date = date.fromisoformat(datetime_text)
+        except ValueError:
+            return None
+        parsed_datetime = datetime(
+            parsed_date.year,
+            parsed_date.month,
+            parsed_date.day,
+            tzinfo=BEIJING_TIMEZONE,
+        )
+
+    if parsed_datetime.tzinfo is None:
+        parsed_datetime = parsed_datetime.replace(tzinfo=BEIJING_TIMEZONE)
+
+    return parsed_datetime.astimezone(BEIJING_TIMEZONE)
 
 
 def get_notion_formula_year_text(property_map: dict[str, Any], property_name: str) -> Optional[str]:
@@ -1496,6 +1577,86 @@ def build_date_property(date_text: Optional[str]) -> dict[str, Any]:
     return {"date": {"start": date_text}}
 
 
+def build_datetime_property(current_datetime: datetime) -> dict[str, Any]:
+    """Build a Notion date property payload for a full Beijing datetime."""
+
+    return {"date": {"start": format_beijing_datetime_for_notion(current_datetime)}}
+
+
+def create_sync_log_record(
+    config: Config,
+    sync_log_state: SyncLogState,
+    current_datetime: datetime,
+    mode: str,
+    stats: SyncStats,
+    steam_game_count: int,
+    notion_game_count: int,
+) -> None:
+    """Create one Notion sync log row for the completed run."""
+
+    index_text = build_next_sync_log_index_text(sync_log_state, current_datetime)
+    status = SYNC_STATUS_COMPLETED_WITH_ERRORS if stats.error_count > 0 else SYNC_STATUS_SUCCESS
+    context = f"sync_log, index={index_text}, mode={mode}, status={status}"
+    page_id = create_notion_page(
+        config,
+        config.notion_sync_log_data_source_id,
+        build_sync_log_properties(
+            index_text,
+            current_datetime,
+            mode,
+            status,
+            stats,
+            steam_game_count,
+            notion_game_count,
+        ),
+        context,
+    )
+
+    if page_id:
+        log_info(f"Created sync log row. {context}")
+
+
+def build_next_sync_log_index_text(sync_log_state: SyncLogState, current_datetime: datetime) -> str:
+    """Build the next sync log Index title value."""
+
+    if sync_log_state.query_succeeded and sync_log_state.latest_index is not None:
+        return str(sync_log_state.latest_index + 1)
+
+    if sync_log_state.query_succeeded:
+        return "1"
+
+    return current_datetime.astimezone(BEIJING_TIMEZONE).strftime("%Y%m%d%H%M%S")
+
+
+def build_sync_log_properties(
+    index_text: str,
+    current_datetime: datetime,
+    mode: str,
+    status: str,
+    stats: SyncStats,
+    steam_game_count: int,
+    notion_game_count: int,
+) -> dict[str, Any]:
+    """Build Notion properties for one sync log row."""
+
+    return {
+        SYNC_LOG_INDEX_PROPERTY_NAME: build_title_property(index_text),
+        SYNC_LOG_DATETIME_PROPERTY_NAME: build_datetime_property(current_datetime),
+        SYNC_LOG_MODE_PROPERTY_NAME: build_select_property(mode),
+        SYNC_LOG_STATUS_PROPERTY_NAME: build_select_property(status),
+        SYNC_LOG_STEAM_GAME_NUM_PROPERTY_NAME: {"number": steam_game_count},
+        SYNC_LOG_NOTION_GAME_NUM_PROPERTY_NAME: {"number": notion_game_count},
+        SYNC_LOG_CREATED_GAME_NUM_PROPERTY_NAME: {"number": stats.created_game_count},
+        SYNC_LOG_UPDATED_GAME_NUM_PROPERTY_NAME: {"number": stats.updated_game_count},
+        SYNC_LOG_UNCHANGED_GAME_NUM_PROPERTY_NAME: {"number": stats.unchanged_game_count},
+        SYNC_LOG_CREATED_PLAYTIME_RECORD_NUM_PROPERTY_NAME: {"number": stats.created_playtime_record_count},
+        SYNC_LOG_SKIPPED_EXTRA_NOTION_GAME_NUM_PROPERTY_NAME: {
+            "number": stats.skipped_extra_notion_game_count
+        },
+        SYNC_LOG_ERROR_NUM_PROPERTY_NAME: {"number": stats.error_count},
+    }
+
+
 def create_notion_page(
     config: Config,
     data_source_id: str,
@@ -1642,11 +1803,11 @@ def sync_game_list(
     include_playtime: bool,
     create_playtime_records: bool,
     is_initial_sync: bool,
+    today_text: str,
 ) -> SyncStats:
     """Synchronize Steam game snapshots into Notion."""
 
     stats = SyncStats()
-    today_text = date.today().isoformat()
     steam_game_index = {steam_game.app_id: steam_game for steam_game in steam_game_list}
 
     for steam_game in sorted(steam_game_list, key=lambda item: item.name.lower()):
@@ -2643,6 +2804,18 @@ def print_summary(stats: SyncStats) -> None:
     log_info(f"  error_count={stats.error_count}")
 
 
+def build_sync_mode(is_initial_sync: bool, is_same_day_repeat: bool) -> str:
+    """Return the sync log Mode value for the current run."""
+
+    if is_initial_sync:
+        return SYNC_MODE_INITIAL
+
+    if is_same_day_repeat:
+        return SYNC_MODE_SAME_DAY_REPEAT
+
+    return SYNC_MODE_DAILY
+
+
 def run_sync() -> None:
     """Run the full Steam to Notion sync once."""
 
@@ -2650,29 +2823,39 @@ def run_sync() -> None:
     if config is None:
         return
 
-    state_file_path = get_state_file_path()
-    sync_state = load_sync_state(state_file_path)
-    today_text = date.today().isoformat()
-    is_initial_sync = not sync_state.has_known_last_update_date
-    is_same_day_repeat = sync_state.has_known_last_update_date and sync_state.last_update_date == today_text
+    current_datetime = get_beijing_now()
+    today_text = get_beijing_date_text(current_datetime)
+    sync_log_state = load_sync_log_state(config)
+    last_update_datetime = sync_log_state.last_update_datetime
+    last_update_date_text = (
+        get_beijing_date_text(last_update_datetime)
+        if last_update_datetime is not None
+        else None
+    )
+    is_initial_sync = not sync_log_state.has_known_last_update_datetime
+    is_same_day_repeat = (
+        sync_log_state.has_known_last_update_datetime
+        and last_update_date_text == today_text
+    )
     include_playtime = not is_same_day_repeat
     create_playtime_records = include_playtime and not is_initial_sync
+    sync_mode = build_sync_mode(is_initial_sync, is_same_day_repeat)
 
     if is_initial_sync:
         log_info(
             "First initialization is enabled for this run. "
-            f"last_update_date={sync_state.last_update_date}, current_date={today_text}. "
+            f"last_update_datetime={last_update_datetime}, current_date={today_text}. "
             "Game totals and achievements will be synced, but no playtime records will be created."
         )
     elif include_playtime:
         log_info(
             "Playtime sync is enabled for this run. "
-            f"last_update_date={sync_state.last_update_date}, current_date={today_text}"
+            f"last_update_datetime={last_update_datetime}, current_date={today_text}"
         )
     else:
         log_info(
             "Playtime sync is skipped because current date was already processed. "
-            f"last_update_date={sync_state.last_update_date}, current_date={today_text}"
+            f"last_update_datetime={last_update_datetime}, current_date={today_text}"
         )
 
     steam_game_list = fetch_steam_game_list(config)
@@ -2707,16 +2890,20 @@ def run_sync() -> None:
         include_playtime,
         create_playtime_records,
         is_initial_sync,
+        today_text,
     )
     sync_stats.error_count += stats.error_count
 
-    if include_playtime:
-        save_sync_state(
-            state_file_path,
-            SyncState(last_update_date=today_text, has_known_last_update_date=True),
-        )
-
     sync_summary_count_fields(config)
+    create_sync_log_record(
+        config,
+        sync_log_state,
+        current_datetime,
+        sync_mode,
+        sync_stats,
+        len(steam_game_list),
+        len(notion_game_page_index),
+    )
     print_summary(sync_stats)
 
 

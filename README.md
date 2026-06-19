@@ -10,6 +10,7 @@
 - 将每次同步时的当前总时长和相对上一次的差值写入时长记录表。
 - 非重复统计日查询Steam成就，并同步总成就数和已完成成就数。
 - 为游戏总表写入Steam封面URL和图标URL，并把Notion页面cover和icon设置为对应图片。
+- 使用Notion更新记录表判断同日重复运行，不依赖GitHub Actions cache。
 - Notion里多出来的游戏只输出报告，不删除、不归档。
 - 程序会尽量捕获异常并继续运行，GitHub Actions最终退出码保持`0`。
 
@@ -22,13 +23,13 @@
 - `NOTION_API_KEY`
 - `NOTION_GAME_DATA_SOURCE_ID`
 - `NOTION_PLAYTIME_DATA_SOURCE_ID`
+- `NOTION_SYNC_LOG_DATA_SOURCE_ID`
 
 可选：
 
 - `NOTION_PERIOD_DATA_SOURCE_ID`，月度/年度统计表data source id；未配置时会跳过周期统计，但不影响基础时长记录写入。
 - `NOTION_SUMMARY_DATA_SOURCE_ID`，月度/年度总结表data source id；未配置时会跳过总结关联，但不影响基础时长记录写入。
 - `NOTION_VERSION`，默认值为`2025-09-03`。
-- `STEAM_SYNC_STATE_FILE`，默认值为`steam_sync`目录下的`.steam_sync_state/state.json`。
 - `STEAM_ACHIEVEMENT_MAX_WORKERS`，默认值为`5`，表示成就查询并发线程数。
 - `STEAM_ACHIEVEMENT_REQUEST_INTERVAL_SECONDS`，默认值为`0.2`，表示所有成就请求共享同一个启动间隔，默认最多每秒5个请求。
 
@@ -100,6 +101,23 @@
 | `PlayedGameNum` | number |
 | `TotalPlayTimeMinutes` | number |
 
+更新记录表需要这些字段：
+
+| 字段名 | 类型 |
+| --- | --- |
+| `Index` | title，数字文本，数字越大表示记录越新 |
+| `DateTime` | date，完整日期时间，程序写入带`+08:00`偏移的北京时间 |
+| `Mode` | select，选项为`Initial`、`Daily`、`SameDayRepeat` |
+| `Status` | select，选项为`Success`或`CompletedWithErrors` |
+| `SteamGameNum` | number |
+| `NotionGameNum` | number |
+| `CreatedGameNum` | number |
+| `UpdatedGameNum` | number |
+| `UnchangedGameNum` | number |
+| `CreatedPlaytimeRecordNum` | number |
+| `SkippedExtraNotionGameNum` | number |
+| `ErrorNum` | number |
+
 ## 同步规则
 
 - 使用`AppID`作为唯一键。
@@ -115,7 +133,9 @@
 - 每个游戏的`IconImageUrl`由Steam返回的`img_icon_url`拼接为`http://media.steampowered.com/steamcommunity/public/images/apps/{appid}/{img_icon_url}.jpg`。
 - Notion页面cover使用同一个封面URL，画廊视图可以选择页面封面作为卡片封面。
 - Notion页面icon使用同一个图标URL，画廊视图可以显示页面图标。
-- 如果状态文件不存在、为空、损坏或没有有效`last_update_date`，本次运行会被视为第一次初始化。
+- 程序会读取更新记录表的完整数据，选择`Index`数字最大的记录作为最新记录。
+- 如果最新记录的`DateTime`与当前北京时间在同一天，本次运行会被视为同日重复运行。
+- 如果更新记录表为空、查询失败、没有有效数字`Index`或最新记录没有有效`DateTime`，本次运行会被视为第一次初始化。
 - 第一次初始化会更新总时长、成就和`UnrecordPlaytimeMinutes`，但不会写入任何时长记录。
 - 如果本次日期还没有处理过时长：更新总时长和成就字段；新增游戏会写入一条时长记录，`DeltaMinutes = TotalPlaytimeMinutes`。
 - 非第一次运行时，新游戏总时长超过480分钟会被视为历史未记录数据，只写入游戏总表和`UnrecordPlaytimeMinutes`，不写时长记录。
@@ -127,6 +147,7 @@
 - 每次同步结束前会全量重算月度/年度总结表的`NewGameNum`、`CompleteGameNum`、`FullAchievementGameNum`、`PlayedGameNum`和`TotalPlayTimeMinutes`，不是增量累加。
 - 总结数字中，购买、通关、全成就数量来自游戏总表的`BuyYear`/`BuyMonth`、`CompleteYear`/`CompleteMonth`、`FullAchievementYear`/`FullAchievementMonth`；游玩数量来自月度/年度统计表中相同`Period + Type`的条目数；总游玩时长来自这些条目的`PlayTimeMinutes`总和。
 - 如果本次日期已经处理过时长：只更新游戏名称、商店链接、缺失的封面URL、图标URL、页面cover和页面icon，不更新总时长和成就字段，也不写时长记录。
+- 每次主流程成功走完后，程序会在更新记录表写入一条记录，记录北京时间`DateTime`、运行模式和本次同步计数。
 - 成就接口成功且包含`achievements`时，统计总成就数和已完成成就数。
 - 成就接口成功但没有`achievements`时，写入`0 / 0`。
 - 成就接口失败或返回结构异常时，不覆盖Notion旧成就字段，只输出日志。
@@ -135,17 +156,11 @@
 
 ## 跨GitHub Actions运行状态
 
-程序用状态文件保存上次处理时长和成就的日期：
+程序不依赖GitHub Actions cache，也不会写入本地状态文件。跨运行状态保存在Notion更新记录表中。
 
-```json
-{
-  "last_update_date": "2026-06-17"
-}
-```
+每次运行开始时，程序会读取更新记录表所有页面，找到`Index`数字最大的记录，并把该记录的`DateTime`转换为UTC+8北京时间。如果该时间与当前北京时间是同一天，就跳过时长和成就相关更新；否则正常处理。读取失败、没有记录或字段无效时，本次运行会被当作第一次初始化。
 
-GitHub Actions workflow使用`actions/cache`保存`.steam_sync_state`目录。这样手动触发同一天的workflow时，程序可以识别当天已经处理过时长和成就，只更新游戏基础条目、封面和图标，避免重复生成时长记录或重复发送大量成就查询请求。
-
-状态文件只包含日期，不包含任何密钥。目录内的`.gitignore`会忽略`.steam_sync_state/`，避免本地运行后误提交。
+每次主流程成功走完后，程序会写入新的更新记录。正常读取到最大`Index`时，新记录使用`Index + 1`；如果读取更新记录表失败导致无法知道最大编号，会使用北京时间时间戳作为兜底`Index`。
 
 ## Notion维护工具
 
@@ -180,8 +195,8 @@ python main.py
 
 ## GitHub Actions
 
-仓库根目录为`steam_sync`时，项目已经提供`.github/workflows/steam-to-notion.yml`。上传到GitHub后会在北京时间每天凌晨2点自动执行，并支持在Actions页面通过`workflow_dispatch`手动启动。
+仓库根目录为`steam_sync`时，项目已经提供`.github/workflows/steam-to-notion.yml`。上传到GitHub后会在北京时间每天凌晨4点自动执行，并支持在Actions页面通过`workflow_dispatch`手动启动。
 
-GitHub cron使用UTC时间，所以北京时间`02:00`对应workflow中的`0 18 * * *`。
+GitHub cron使用UTC时间，所以北京时间`04:00`对应workflow中的`0 20 * * *`。
 
 正式部署前请确认`run_sync()`没有继续使用测试阶段写死的`Config(...)`覆盖环境变量，否则GitHub Actions传入的Secrets不会生效。
